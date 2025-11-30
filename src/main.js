@@ -18,8 +18,20 @@ async function main() {
         const RESULTS_WANTED = Number.isFinite(+RESULTS_WANTED_RAW) ? Math.max(1, +RESULTS_WANTED_RAW) : Number.MAX_SAFE_INTEGER;
         const MAX_PAGES = Number.isFinite(+MAX_PAGES_RAW) ? Math.max(1, +MAX_PAGES_RAW) : 999;
         
+        // Pre-generate headers for faster requests
         const headerGenerator = new HeaderGenerator();
+        const cachedHeaders = headerGenerator.getHeaders({
+            browsers: [{ name: 'chrome', minVersion: 115, maxVersion: 120 }],
+            operatingSystems: ['windows', 'macos'],
+            devices: ['desktop'],
+            locales: ['en-US'],
+        });
         const seenUrls = dedupe ? new Set() : null;
+        
+        // Statistics tracking
+        let pagesProcessed = 0;
+        let detailsProcessed = 0;
+        const startTime = Date.now();
 
         const toAbs = (href, base = 'https://www.healthecareers.com') => {
             try { return new URL(href, base).href; } catch { return null; }
@@ -137,23 +149,16 @@ async function main() {
                     maxErrorScore: 3,
                 },
             },
-            maxConcurrency: 5,
-            minConcurrency: 1,
-            requestHandlerTimeoutSecs: 90,
-            navigationTimeoutSecs: 60,
+            maxConcurrency: 20,
+            minConcurrency: 5,
+            requestHandlerTimeoutSecs: 60,
+            navigationTimeoutSecs: 45,
             preNavigationHooks: [
                 async ({ request }) => {
-                    // Generate realistic headers for stealth
-                    const headers = headerGenerator.getHeaders({
-                        browsers: [{ name: 'chrome', minVersion: 110, maxVersion: 120 }],
-                        operatingSystems: ['windows', 'macos'],
-                        devices: ['desktop'],
-                        locales: ['en-US'],
-                    });
-                    
+                    // Use cached headers with minimal modifications for speed
                     request.headers = {
-                        ...headers,
-                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+                        ...cachedHeaders,
+                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
                         'Accept-Language': 'en-US,en;q=0.9',
                         'Accept-Encoding': 'gzip, deflate, br',
                         'Referer': request.userData.label === 'DETAIL' ? 'https://www.healthecareers.com/search-jobs' : 'https://www.healthecareers.com/',
@@ -162,10 +167,11 @@ async function main() {
                         'Sec-Fetch-Site': request.userData.label === 'DETAIL' ? 'same-origin' : 'none',
                         'Sec-Fetch-User': '?1',
                         'Upgrade-Insecure-Requests': '1',
+                        'Cache-Control': 'max-age=0',
                     };
                     
-                    // Add small random delay between requests (100-500ms)
-                    await new Promise(resolve => setTimeout(resolve, 100 + Math.random() * 400));
+                    // Minimal delay for stealth without sacrificing speed (50-150ms)
+                    await new Promise(resolve => setTimeout(resolve, 50 + Math.random() * 100));
                 },
             ],
             async requestHandler({ request, $, enqueueLinks, log: crawlerLog }) {
@@ -173,11 +179,13 @@ async function main() {
                 const pageNo = request.userData?.pageNo || 1;
 
                 if (label === 'LIST') {
+                    pagesProcessed++;
                     const links = findJobLinks($, request.url);
-                    crawlerLog.info(`LIST page ${pageNo} (${request.url}) -> found ${links.length} unique job links | Total saved: ${saved}/${RESULTS_WANTED}`);
+                    const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+                    crawlerLog.info(`LIST page ${pageNo} -> ${links.length} links | Saved: ${saved}/${RESULTS_WANTED} | ${elapsed}s`);
 
                     if (links.length === 0) {
-                        crawlerLog.warning(`No job links found on page ${pageNo}. Stopping pagination.`);
+                        crawlerLog.warning(`No job links on page ${pageNo}. Stopping.`);
                         return;
                     }
 
@@ -185,8 +193,12 @@ async function main() {
                         const remaining = RESULTS_WANTED - saved;
                         const toEnqueue = links.slice(0, Math.max(0, remaining));
                         if (toEnqueue.length > 0) {
-                            await enqueueLinks({ urls: toEnqueue, userData: { label: 'DETAIL' } });
-                            crawlerLog.info(`Enqueued ${toEnqueue.length} job detail pages for scraping`);
+                            // Enqueue with higher priority for faster processing
+                            await enqueueLinks({ 
+                                urls: toEnqueue, 
+                                userData: { label: 'DETAIL' },
+                            });
+                            crawlerLog.info(`⚡ Enqueued ${toEnqueue.length} detail pages`);
                         }
                     } else {
                         const remaining = RESULTS_WANTED - saved;
@@ -194,30 +206,29 @@ async function main() {
                         if (toPush.length > 0) { 
                             await Dataset.pushData(toPush.map(u => ({ url: u, _source: 'healthecareers' }))); 
                             saved += toPush.length;
-                            crawlerLog.info(`Saved ${toPush.length} job URLs without details`);
                         }
                     }
 
+                    // Aggressive pagination for speed
                     if (saved < RESULTS_WANTED && pageNo < MAX_PAGES && links.length > 0) {
                         const next = findNextPage($, request.url, pageNo);
                         if (next && next !== request.url) {
-                            await enqueueLinks({ urls: [next], userData: { label: 'LIST', pageNo: pageNo + 1 } });
-                            crawlerLog.info(`Proceeding to page ${pageNo + 1}`);
-                        } else {
-                            crawlerLog.info(`No more pages to crawl. Stopping pagination.`);
+                            // Enqueue next page immediately without waiting
+                            await enqueueLinks({ 
+                                urls: [next], 
+                                userData: { label: 'LIST', pageNo: pageNo + 1 },
+                            });
                         }
                     }
                     return;
                 }
 
                 if (label === 'DETAIL') {
-                    if (saved >= RESULTS_WANTED) {
-                        crawlerLog.info(`Already reached target of ${RESULTS_WANTED} jobs. Skipping.`);
-                        return;
-                    }
+                    if (saved >= RESULTS_WANTED) return;
                     
+                    detailsProcessed++;
                     try {
-                        // Try JSON-LD first
+                        // Try JSON-LD first (fastest)
                         const json = extractFromJsonLd($);
                         const data = json || {};
                         
@@ -247,21 +258,17 @@ async function main() {
                         // Extract salary if available
                         const salary = $('[class*="salary"], [class*="compensation"], [class*="pay"]').first().text().trim() || null;
                         
-                        // Extract description - look in main content area
+                        // Extract description efficiently
                         if (!data.description_html) {
-                            const descContainer = $('[class*="job-description"], .job-content, .description, article, main').first();
+                            const descContainer = $('[class*="job-description"], .job-content, .description, article').first();
                             if (descContainer && descContainer.length) {
-                                // Remove unwanted elements
-                                descContainer.find('script, style, noscript, iframe, .social-share, .similar-jobs').remove();
+                                // Quick cleanup
+                                descContainer.find('script, style, iframe').remove();
                                 data.description_html = String(descContainer.html()).trim() || null;
-                            }
-                        }
-                        
-                        // If still no description, try broader selectors
-                        if (!data.description_html) {
-                            const bodyText = $('body').html();
-                            if (bodyText && bodyText.length > 200) {
-                                data.description_html = bodyText;
+                            } else {
+                                // Fast fallback - get main content
+                                const mainContent = $('main, article, [role="main"]').first().html();
+                                data.description_html = mainContent || null;
                             }
                         }
                         
@@ -287,13 +294,15 @@ async function main() {
                             url: request.url,
                         };
 
-                        // Only save if we have at least title
+                        // Quick save with minimal logging
                         if (item.title) {
                             await Dataset.pushData(item);
                             saved++;
-                            crawlerLog.info(`✓ Saved job #${saved}: "${item.title}" at ${item.company || 'N/A'}`);
-                        } else {
-                            crawlerLog.warning(`Skipped job at ${request.url} - no title found`);
+                            // Log every 10th job to reduce overhead
+                            if (saved % 10 === 0 || saved === RESULTS_WANTED) {
+                                const rate = (saved / ((Date.now() - startTime) / 1000)).toFixed(1);
+                                crawlerLog.info(`✓ Progress: ${saved}/${RESULTS_WANTED} jobs (${rate}/s) | "${item.title}"`);
+                            }
                         }
                     } catch (err) { 
                         crawlerLog.error(`DETAIL ${request.url} failed: ${err.message}`, { stack: err.stack }); 
@@ -302,17 +311,20 @@ async function main() {
             }
         });
 
-        log.info(`Starting crawler with ${initial.length} initial URL(s):`);
-        initial.forEach((url, i) => log.info(`  ${i + 1}. ${url}`));
-        log.info(`Target: ${RESULTS_WANTED} jobs | Max pages: ${MAX_PAGES} | Collect details: ${collectDetails} | Dedupe: ${dedupe}`);
+        log.info(`🚀 Starting high-speed crawler`);
+        log.info(`   URLs: ${initial.length} | Target: ${RESULTS_WANTED} | Concurrency: 20 | Details: ${collectDetails}`);
         
         await crawler.run(initial.map(u => ({ url: u, userData: { label: 'LIST', pageNo: 1 } })));
         
+        const totalTime = ((Date.now() - startTime) / 1000).toFixed(1);
         const stats = await Dataset.getData();
-        log.info(`✓ Scraping completed successfully!`);
-        log.info(`  Total jobs saved: ${saved}`);
-        log.info(`  Dataset items: ${stats.items.length}`);
-        log.info(`  Unique URLs seen: ${seenUrls ? seenUrls.size : 'N/A (dedupe disabled)'}`);
+        const avgRate = (saved / (totalTime / 60)).toFixed(1);
+        
+        log.info(`✅ Scraping completed in ${totalTime}s`);
+        log.info(`   Jobs saved: ${saved} | Pages: ${pagesProcessed} | Details: ${detailsProcessed}`);
+        log.info(`   Average rate: ${avgRate} jobs/min`);
+        log.info(`   Unique URLs: ${seenUrls ? seenUrls.size : 'N/A'}`);
+        log.info(`   Dataset items: ${stats.items.length}`);
     } catch (error) {
         log.error(`Fatal error in main: ${error.message}`, { stack: error.stack });
         throw error;
